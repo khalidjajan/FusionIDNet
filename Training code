@@ -1,0 +1,1080 @@
+# ==========================================================
+# FusionIDNet (Fingerprint + Iris) — Full Pipeline (ONE CELL)
+# ✅ Rebuild/zip prepared dataset (if missing)
+# ✅ Train fused ID model (ResNet18 + Cross-Attention + AMP)
+# ✅ Stage-B: Unimodal adapters with Learnable Alphas
+# ✅ Ablation (Rank-1/5) + Verification (EER/AUC/TAR@FAR) + Plots + CSVs
+# ==========================================================
+
+import os, math, random, time, json, shutil, zipfile
+from pathlib import Path
+from PIL import Image
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+import torchvision.models as models
+
+from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# -----------------------
+# Repro + Device
+# -----------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SEED = 2026
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+torch.backends.cudnn.benchmark = True
+
+# -----------------------
+# Paths
+# -----------------------
+OUT_ROOT = Path("/kaggle/working/prepared_dataset_ID")       # prepared dataset output
+SAVE_DIR = Path("/kaggle/working/publish_artifacts")         # all publish-ready artifacts
+FIG_DIR  = SAVE_DIR / "figs"
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+ZIP_PATH = Path("/kaggle/working/prepared_dataset_ID.zip")
+
+# -----------------------
+# Hyperparams
+# -----------------------
+IMG_SIZE     = 224
+BATCH_SIZE   = 96
+EPOCHS_FUSED = 30
+EPOCHS_UNI   = 8          # unimodal adapter stage (fast)
+NUM_WORKERS  = 2
+EMB_DIM      = 256
+LR           = 1e-3
+WD           = 1e-4
+
+LEVELS_ALL   = ["clean","easy","medium","hard"]
+TRAIN_LEVELS = ["clean","easy","medium"]  # keep hard for test
+VAL_LEVELS   = ["clean","easy","medium"]
+TEST_LEVELS  = ["clean","easy","medium","hard"]
+
+IMG_EXTS = {".png",".jpg",".jpeg",".bmp",".tif",".tiff",".webp"}
+
+print("✅ DEVICE:", DEVICE)
+
+# ==========================================================
+# 0) Utils
+# ==========================================================
+def list_imgs(p: Path):
+    if not p.exists(): return []
+    return sorted([x for x in p.rglob("*") if x.is_file() and x.suffix.lower() in IMG_EXTS])
+
+def load_pil(p: Path):
+    return Image.open(p).convert("RGB")
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def l2n(x, dim=1, eps=1e-8):
+    return F.normalize(x, dim=dim, eps=eps)
+
+@torch.no_grad()
+def freeze_bn(module: nn.Module):
+    for m in module.modules():
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad = False
+
+# ==========================================================
+# 1) Prepare dataset (ONLY if OUT_ROOT is missing)
+# ==========================================================
+def is_prepared_root(p: Path):
+    return (p/"fingerprint"/"train"/"clean").exists() and (p/"iris"/"train"/"clean").exists()
+
+def is_raw_root(p: Path):
+    return (p/"fingerprint"/"clean").exists() and (p/"iris"/"clean").exists()
+
+def find_raw_root():
+    base = Path("/kaggle/input")
+    if not base.exists():
+        raise FileNotFoundError("❌ /kaggle/input not found (are you running on Kaggle?).")
+
+    candidates = []
+    for d in base.rglob("*"):
+        if d.is_dir() and is_raw_root(d):
+            candidates.append(d)
+
+    candidates = sorted(candidates, key=lambda x: len(str(x)))
+    if len(candidates) == 0:
+        raise FileNotFoundError(
+            "❌ Could not auto-detect RAW dataset root under /kaggle/input.\n"
+            "It must contain:\n"
+            "  fingerprint/clean/<subject>/...\n"
+            "  iris/clean/<subject>/...\n"
+        )
+    return candidates[0]
+
+def split_list(items, r_train=0.70, r_val=0.15, r_test=0.15):
+    items = items[:]
+    random.shuffle(items)
+    n = len(items)
+    n_tr = int(r_train*n)
+    n_va = int(r_val*n)
+    tr = items[:n_tr]
+    va = items[n_tr:n_tr+n_va]
+    te = items[n_tr+n_va:]
+    if len(te) == 0 and len(items) > 0:
+        te = items[-1:]
+    return tr, va, te
+
+def rebuild_prepared_dataset(src_root: Path, out_root: Path, overwrite=True):
+    if overwrite and out_root.exists():
+        shutil.rmtree(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    for modality in ["fingerprint", "iris"]:
+        base = src_root/modality
+        assert base.exists(), f"❌ Missing modality folder: {base}"
+
+        clean_dir = base/"clean"
+        subjects = sorted([d.name for d in clean_dir.iterdir() if d.is_dir()])
+        assert len(subjects) > 0, f"❌ No subjects found in {clean_dir}"
+
+        for subj in subjects:
+            for lvl in LEVELS_ALL:
+                sdir = base/lvl/subj
+                imgs = list_imgs(sdir)
+                if len(imgs) == 0:
+                    continue
+
+                tr, va, te = split_list(imgs, 0.70, 0.15, 0.15)
+                for split_name, lst in [("train", tr), ("val", va), ("test", te)]:
+                    for img in lst:
+                        dst = out_root/modality/split_name/lvl/subj/img.name
+                        ensure_dir(dst.parent)
+                        shutil.copy2(img, dst)
+
+    print("✅ Prepared dataset created at:", out_root)
+
+def make_zip(zip_path: Path, folder: Path):
+    if zip_path.exists():
+        zip_path.unlink()
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in folder.rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(folder))
+    print("✅ ZIP saved:", zip_path)
+
+if not is_prepared_root(OUT_ROOT):
+    print("⚠️ OUT_ROOT missing or incomplete, rebuilding prepared dataset...")
+    SRC_ROOT = find_raw_root()
+    print("✅ RAW SRC_ROOT detected:", SRC_ROOT)
+    rebuild_prepared_dataset(SRC_ROOT, OUT_ROOT, overwrite=True)
+    make_zip(ZIP_PATH, OUT_ROOT)
+else:
+    print("✅ Found prepared dataset:", OUT_ROOT)
+    make_zip(ZIP_PATH, OUT_ROOT)
+
+
+# ==========================================================
+# 2) Subject list
+# ==========================================================
+fp_clean_train = OUT_ROOT/"fingerprint"/"train"/"clean"
+ir_clean_train = OUT_ROOT/"iris"/"train"/"clean"
+
+fp_subs = {d.name for d in fp_clean_train.iterdir() if d.is_dir()}
+ir_subs = {d.name for d in ir_clean_train.iterdir() if d.is_dir()}
+SUBJECTS = sorted(list(fp_subs & ir_subs))
+assert len(SUBJECTS) > 0, "❌ No common subjects found."
+
+class_to_idx = {s:i for i,s in enumerate(SUBJECTS)}
+NUM_CLASSES = len(SUBJECTS)
+print(f"✅ SUBJECTS = {NUM_CLASSES}")
+# ==========================================================
+# 3) Transforms (Updated to ImageNet Stats for ResNet)
+# ==========================================================
+train_tf = transforms.Compose([
+    transforms.Resize((256,256)),
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.85, 1.0)),
+    transforms.RandomHorizontalFlip(p=0.2),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(0.10,0.10,0.10,0.05),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+eval_tf = transforms.Compose([
+    transforms.Resize((256,256)),
+    transforms.CenterCrop(IMG_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+# ==========================================================
+# 4) Datasets
+# ==========================================================
+class PairedTrainDataset(Dataset):
+    def __init__(self, root, split, use_levels, transform, pairs_per_subject=30):
+        self.root = Path(root); self.split = split
+        self.use_levels = list(use_levels)
+        self.transform = transform
+        self.subjects = SUBJECTS
+        self.pairs_per_subject = pairs_per_subject
+
+        self.fp = {lvl:{} for lvl in self.use_levels}
+        self.ir = {lvl:{} for lvl in self.use_levels}
+        for lvl in self.use_levels:
+            for s in self.subjects:
+                self.fp[lvl][s] = list_imgs(self.root/"fingerprint"/split/lvl/s)
+                self.ir[lvl][s] = list_imgs(self.root/"iris"/split/lvl/s)
+
+        self.index = []
+        for s in self.subjects:
+            self.index += [s]*pairs_per_subject
+
+        print(f"✅ TRAIN | subjects={len(self.subjects)} | items={len(self.index)} | levels={self.use_levels}")
+
+    def __len__(self): return len(self.index)
+
+    def _pick(self, table, lvl, s):
+        lst = table[lvl][s]
+        if len(lst)==0:
+            lst = table[self.use_levels[0]][s]
+        return random.choice(lst)
+
+    def __getitem__(self, i):
+        s = self.index[i]
+        y = class_to_idx[s]
+        lvl = random.choice(self.use_levels)
+        fp_p = self._pick(self.fp, lvl, s)
+        ir_p = self._pick(self.ir, lvl, s)
+        fp = self.transform(load_pil(fp_p))
+        ir = self.transform(load_pil(ir_p))
+        return fp, ir, y
+
+class PairedDeterministicDataset(Dataset):
+    def __init__(self, root, split, use_levels, transform, max_fp=6, max_ir=6, seed=2026):
+        self.root = Path(root); self.split = split
+        self.use_levels = list(use_levels)
+        self.transform = transform
+        self.subjects = SUBJECTS
+
+        rng = random.Random(seed + (0 if split=="val" else 999))
+        pairs = []
+        for lvl in self.use_levels:
+            for s in self.subjects:
+                fp_imgs = list_imgs(self.root/"fingerprint"/split/lvl/s)[:max_fp]
+                ir_imgs = list_imgs(self.root/"iris"/split/lvl/s)[:max_ir]
+                if len(fp_imgs)==0 or len(ir_imgs)==0:
+                    continue
+                comb = [(i,j) for i in range(len(fp_imgs)) for j in range(len(ir_imgs))]
+                rng.shuffle(comb)
+                take = min(len(comb), max(12, len(fp_imgs)+len(ir_imgs)))
+                for (i,j) in comb[:take]:
+                    pairs.append((fp_imgs[i], ir_imgs[j], class_to_idx[s]))
+        self.pairs = pairs
+        print(f"✅ {split.upper()} | pairs={len(self.pairs)} | levels={self.use_levels} (DETERMINISTIC)")
+
+    def __len__(self): return len(self.pairs)
+
+    def __getitem__(self, idx):
+        fp_p, ir_p, y = self.pairs[idx]
+        fp = self.transform(load_pil(fp_p))
+        ir = self.transform(load_pil(ir_p))
+        return fp, ir, y
+
+train_ds = PairedTrainDataset(OUT_ROOT, "train", TRAIN_LEVELS, train_tf, pairs_per_subject=30)
+val_ds   = PairedDeterministicDataset(OUT_ROOT, "val", VAL_LEVELS, eval_tf, max_fp=6, max_ir=6, seed=SEED)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+# ==========================================================
+# 5) Model Architecture (Q1 Level: ResNet + Cross-Attention)
+# ==========================================================
+class QualityGate(nn.Module):
+    def __init__(self, emb_dim):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(emb_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, emb):
+        q = self.fc(emb)
+        emb = emb * (0.5 + q)
+        return emb, q
+
+class ResNetBackbone(nn.Module):
+    def __init__(self, out_dim=256):
+        super().__init__()
+        weights = models.ResNet18_Weights.IMAGENET1K_V1
+        resnet = models.resnet18(weights=weights)
+        self.features = nn.Sequential(*list(resnet.children())[:-1])
+        self.proj = nn.Linear(512, out_dim)
+        self.bn = nn.BatchNorm1d(out_dim)
+        self.qgate = QualityGate(out_dim)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        x = self.bn(self.proj(x))
+        x, q = self.qgate(x)
+        return x, q
+
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, emb_dim):
+        super().__init__()
+        self.query_fp = nn.Linear(emb_dim, emb_dim)
+        self.key_ir   = nn.Linear(emb_dim, emb_dim)
+        self.value_ir = nn.Linear(emb_dim, emb_dim)
+        
+        self.query_ir = nn.Linear(emb_dim, emb_dim)
+        self.key_fp   = nn.Linear(emb_dim, emb_dim)
+        self.value_fp = nn.Linear(emb_dim, emb_dim)
+        
+        self.scale = emb_dim ** -0.5
+        
+        self.fc_fuse = nn.Sequential(
+            nn.Linear(emb_dim * 2, emb_dim),
+            nn.BatchNorm1d(emb_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3)
+        )
+
+    def forward(self, fp, ir):
+        q_fp = self.query_fp(fp).unsqueeze(1)
+        k_ir = self.key_ir(ir).unsqueeze(1)
+        v_ir = self.value_ir(ir).unsqueeze(1)
+        attn_fp = F.softmax(torch.bmm(q_fp, k_ir.transpose(1, 2)) * self.scale, dim=-1)
+        out_fp = torch.bmm(attn_fp, v_ir).squeeze(1) + fp
+
+        q_ir = self.query_ir(ir).unsqueeze(1)
+        k_fp = self.key_fp(fp).unsqueeze(1)
+        v_fp = self.value_fp(fp).unsqueeze(1)
+        attn_ir = F.softmax(torch.bmm(q_ir, k_fp.transpose(1, 2)) * self.scale, dim=-1)
+        out_ir = torch.bmm(attn_ir, v_fp).squeeze(1) + ir
+        
+        fused = torch.cat([out_fp, out_ir], dim=1)
+        return self.fc_fuse(fused), attn_fp.squeeze(1), attn_ir.squeeze(1)
+
+class ArcFace(nn.Module):
+    def __init__(self, in_features, out_features, s=30.0, m=0.35):
+        super().__init__()
+        self.s = s; self.m = m
+        self.W = nn.Parameter(torch.randn(out_features, in_features))
+        nn.init.xavier_uniform_(self.W)
+
+    def forward(self, x, y=None):
+        x = l2n(x, dim=1)
+        W = l2n(self.W, dim=1)
+        cos = F.linear(x, W)
+        if y is None:
+            return cos * self.s
+        sin = torch.sqrt(torch.clamp(1.0 - cos**2, min=1e-7))
+        phi = cos*math.cos(self.m) - sin*math.sin(self.m)
+        onehot = torch.zeros_like(cos)
+        onehot.scatter_(1, y.view(-1,1), 1.0)
+        out = onehot*phi + (1.0-onehot)*cos
+        return out * self.s
+
+class FusionIDNet(nn.Module):
+    def __init__(self, num_classes, emb_dim=256):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.fp_net = ResNetBackbone(out_dim=emb_dim)
+        self.ir_net = ResNetBackbone(out_dim=emb_dim)
+
+        self.fusion = CrossAttentionFusion(emb_dim)
+        self.arc = ArcFace(emb_dim, num_classes, s=30.0, m=0.35)
+
+        # Unimodal Adapters (Stage B)
+        self.fp_adapter = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(emb_dim, emb_dim),
+        )
+        self.fp_alpha = nn.Parameter(torch.tensor(0.1)) # Learnable Adapter Weight
+
+        self.ir_adapter = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(emb_dim, emb_dim),
+        )
+        self.ir_alpha = nn.Parameter(torch.tensor(0.1))
+
+        self.fp_uhead = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.BatchNorm1d(emb_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.ir_uhead = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.BatchNorm1d(emb_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward_fused(self, fp, ir, y=None):
+        fp_e, q_fp = self.fp_net(fp)
+        ir_e, q_ir = self.ir_net(ir)
+        
+        z, attn_fp, attn_ir = self.fusion(fp_e, ir_e)
+        logits = self.arc(z, y)
+        
+        g = torch.cat([attn_fp, attn_ir], dim=1) # Pseudo-gate for tracking
+        return logits, z, g, q_fp, q_ir
+
+    def forward_fp_only(self, fp, y=None):
+        fp_e, q_fp = self.fp_net(fp)
+        fp_e = fp_e + self.fp_alpha * self.fp_adapter(fp_e)
+        z = self.fp_uhead(fp_e)
+        logits = self.arc(z, y)
+        return logits, z, q_fp
+
+    def forward_ir_only(self, ir, y=None):
+        ir_e, q_ir = self.ir_net(ir)
+        ir_e = ir_e + self.ir_alpha * self.ir_adapter(ir_e)
+        z = self.ir_uhead(ir_e)
+        logits = self.arc(z, y)
+        return logits, z, q_ir
+
+model = FusionIDNet(NUM_CLASSES, emb_dim=EMB_DIM).to(DEVICE)
+
+
+# ==========================================================
+# 6) Stage-A Train FUSED (UPDATED)
+# ==========================================================
+opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS_FUSED)
+crit = nn.CrossEntropyLoss()
+
+# ✅ تم التحديث لتجنب تحذير Deprecation
+scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
+
+best_acc = 0.0
+best_path = str(SAVE_DIR/"best_model_fused.pth")
+last_path = str(SAVE_DIR/"last_model_fused.pth")
+
+def mod_drop_schedule(ep):
+    if ep <= 3:  return 0.05
+    if ep <= 10: return 0.10
+    return 0.15
+
+def apply_modality_drop(fp, ir, p):
+    B = fp.size(0)
+    mfp = torch.ones(B,1, device=fp.device)
+    mir = torch.ones(B,1, device=fp.device)
+    if p <= 0:
+        return fp, ir, mfp, mir
+    r = torch.rand(B, device=fp.device)
+    drop = (r < p)
+    which = torch.rand(B, device=fp.device) < 0.5
+    drop_fp = drop & which
+    drop_ir = drop & (~which)
+    if drop_fp.any():
+        fp = fp.clone(); fp[drop_fp] = 0.0; mfp[drop_fp] = 0.0
+    if drop_ir.any():
+        ir = ir.clone(); ir[drop_ir] = 0.0; mir[drop_ir] = 0.0
+    return fp, ir, mfp, mir
+
+@torch.no_grad()
+def evaluate_val_acc_fused():
+    model.eval()
+    correct, total = 0, 0
+    for fp, ir, y in val_loader:
+        fp, ir, y = fp.to(DEVICE), ir.to(DEVICE), y.to(DEVICE)
+        logits, _, _, _, _ = model.forward_fused(fp, ir, y=None)
+        pred = logits.argmax(1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+    return correct / max(1, total)
+
+history_fused = []
+print("\n🔥 Stage-A: Train FUSED model (ResNet + Cross-Attention) from scratch...")
+for ep in range(1, EPOCHS_FUSED+1):
+    model.train()
+    t0 = time.time()
+    running = 0.0
+    p_drop = mod_drop_schedule(ep)
+    lam_w  = 0.05
+
+    # ❌ تمت إزالة كود الـ freeze_bn الذي كان يسبب انهيار الـ NaNs هنا
+
+    for step, (fp, ir, y) in enumerate(train_loader, 1):
+        fp, ir, y = fp.to(DEVICE), ir.to(DEVICE), y.to(DEVICE)
+        fp, ir, mfp, mir = apply_modality_drop(fp, ir, p_drop)
+
+        opt.zero_grad(set_to_none=True)
+        
+        # ✅ تم التحديث لتجنب تحذير Deprecation
+        with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+            logits, z, g, q_fp, q_ir = model.forward_fused(fp, ir, y=y)
+            loss_id = crit(logits, y)
+            
+            both = (mfp*mir).detach()
+            wbal = (both * (q_fp - q_ir).abs()).mean() 
+            loss = loss_id + lam_w * wbal
+
+        scaler.scale(loss).backward()
+        
+        # ✅ تمت إضافة Gradient Clipping لحماية الأوزان من الانهيار (NaNs)
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        
+        scaler.step(opt)
+        scaler.update()
+        running += float(loss.item())
+
+        if step % 50 == 0 or step == 1:
+            print(f"Ep {ep:02d}/{EPOCHS_FUSED} | step {step:04d}/{len(train_loader)} | "
+                  f"loss {loss.item():.4f} | "
+                  f"mean(q_fp)={q_fp.mean().item():.3f} | mean(q_ir)={q_ir.mean().item():.3f}",
+                  flush=True)
+
+    sched.step()
+    val_acc = evaluate_val_acc_fused()
+    tr_loss = running / len(train_loader)
+    dt = (time.time() - t0)/60.0
+    print(f"✅ Epoch {ep:02d} DONE | TrainLoss={tr_loss:.4f} | ValAcc={val_acc*100:.2f}% | time={dt:.2f} min", flush=True)
+
+    torch.save(model.state_dict(), last_path)
+    if val_acc > best_acc:
+        best_acc = val_acc
+        torch.save(model.state_dict(), best_path)
+        print(f"🏆 Saved BEST -> {best_path} (ValAcc={best_acc*100:.2f}%)", flush=True)
+
+    history_fused.append({"epoch":ep, "train_loss":float(tr_loss), "val_acc":float(val_acc)})
+
+print("\n✅ Stage-A finished.")
+with open(SAVE_DIR/"train_history_fused.json","w") as f:
+    json.dump(history_fused, f, indent=2)
+
+plt.figure(figsize=(7,5))
+plt.plot([h["epoch"] for h in history_fused], [h["train_loss"] for h in history_fused])
+plt.xlabel("Epoch"); plt.ylabel("Train Loss"); plt.title("Stage-A Fused Training Loss")
+plt.grid(True); plt.tight_layout()
+plt.savefig(FIG_DIR/"stageA_train_loss.png", dpi=200)
+
+plt.figure(figsize=(7,5))
+plt.plot([h["epoch"] for h in history_fused], [h["val_acc"]*100 for h in history_fused])
+plt.xlabel("Epoch"); plt.ylabel("Val Acc (%)"); plt.title("Stage-A Fused Validation Accuracy")
+plt.grid(True); plt.tight_layout()
+plt.savefig(FIG_DIR/"stageA_val_acc.png", dpi=200)
+
+sd = torch.load(best_path, map_location=DEVICE)
+model.load_state_dict(sd, strict=True)
+model.eval()
+print("✅ Loaded BEST fused weights:", best_path)
+
+
+# ==========================================================
+# 7) Stage-B: Unimodal adapters (FP-only / IR-only) (UPDATED)
+# ==========================================================
+class UniTrainDataset(Dataset):
+    def __init__(self, root, mode="fp", split="train", use_levels=None, transform=None, per_subject=25):
+        self.root = Path(root)
+        self.mode = mode
+        self.split = split
+        self.use_levels = list(use_levels or TRAIN_LEVELS)
+        self.transform = transform
+        self.subjects = SUBJECTS
+
+        self.items = []
+        modality = "fingerprint" if mode=="fp" else "iris"
+        for s in self.subjects:
+            for _ in range(per_subject):
+                lvl = random.choice(self.use_levels)
+                imgs = list_imgs(self.root/modality/split/lvl/s)
+                if len(imgs)==0:
+                    imgs = list_imgs(self.root/modality/split/self.use_levels[0]/s)
+                if len(imgs)==0:
+                    continue
+                self.items.append((random.choice(imgs), class_to_idx[s]))
+        print(f"✅ UniTrainDataset({mode}) | items={len(self.items)} | levels={self.use_levels}")
+
+    def __len__(self): return len(self.items)
+
+    def __getitem__(self, idx):
+        p, y = self.items[idx]
+        x = self.transform(load_pil(p))
+        return x, y
+
+def set_requires_grad(m: nn.Module, flag: bool):
+    for p in m.parameters():
+        p.requires_grad = flag
+
+set_requires_grad(model, False)
+set_requires_grad(model.fp_adapter, True)
+set_requires_grad(model.fp_uhead, True)
+model.fp_alpha.requires_grad = True
+set_requires_grad(model.ir_adapter, True)
+set_requires_grad(model.ir_uhead, True)
+model.ir_alpha.requires_grad = True
+
+fp_uni_ds = UniTrainDataset(OUT_ROOT, mode="fp", split="train", use_levels=TRAIN_LEVELS, transform=train_tf, per_subject=25)
+ir_uni_ds = UniTrainDataset(OUT_ROOT, mode="ir", split="train", use_levels=TRAIN_LEVELS, transform=train_tf, per_subject=25)
+
+fp_uni_loader = DataLoader(fp_uni_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+ir_uni_loader = DataLoader(ir_uni_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+
+opt_u = torch.optim.AdamW(
+    list(model.fp_adapter.parameters()) + list(model.fp_uhead.parameters()) + [model.fp_alpha] +
+    list(model.ir_adapter.parameters()) + list(model.ir_uhead.parameters()) + [model.ir_alpha],
+    lr=5e-4, weight_decay=WD
+)
+sched_u = torch.optim.lr_scheduler.CosineAnnealingLR(opt_u, T_max=EPOCHS_UNI)
+
+# ✅ تم التحديث لتجنب تحذير Deprecation
+scaler_u = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
+
+def cycle(dl):
+    while True:
+        for b in dl:
+            yield b
+
+fp_iter = cycle(fp_uni_loader)
+ir_iter = cycle(ir_uni_loader)
+
+history_uni = []
+print("\n🔥 Stage-B: Train unimodal adapters (fix FP-only/IR-only) with Learnable Alphas...")
+for ep in range(1, EPOCHS_UNI+1):
+    model.train()
+    t0 = time.time()
+    running = 0.0
+    steps = min(len(fp_uni_loader), len(ir_uni_loader))
+
+    for step in range(1, steps+1):
+        opt_u.zero_grad(set_to_none=True)
+        if step % 2 == 1:
+            x, y = next(fp_iter)
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            
+            # ✅ تم التحديث لتجنب تحذير Deprecation
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+                logits, z, q = model.forward_fp_only(x, y=y)
+                loss = crit(logits, y)
+        else:
+            x, y = next(ir_iter)
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            
+            # ✅ تم التحديث لتجنب تحذير Deprecation
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+                logits, z, q = model.forward_ir_only(x, y=y)
+                loss = crit(logits, y)
+
+        scaler_u.scale(loss).backward()
+        
+        # ✅ تمت إضافة Gradient Clipping لحماية الأوزان في Stage B أيضاً
+        scaler_u.unscale_(opt_u)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        
+        scaler_u.step(opt_u)
+        scaler_u.update()
+        running += float(loss.item())
+
+        if step % 50 == 0 or step == 1:
+            print(f"Uni Ep {ep:02d}/{EPOCHS_UNI} | step {step:04d}/{steps} | loss {loss.item():.4f}", flush=True)
+
+    sched_u.step()
+    tr_loss = running / max(1, steps)
+    dt = (time.time() - t0)/60.0
+    print(f"✅ Uni Epoch {ep:02d} DONE | TrainLoss={tr_loss:.4f} | fp_alpha={model.fp_alpha.item():.3f} | ir_alpha={model.ir_alpha.item():.3f} | time={dt:.2f} min", flush=True)
+    history_uni.append({"epoch":ep, "train_loss":float(tr_loss)})
+
+print("✅ Stage-B finished.")
+with open(SAVE_DIR/"train_history_unimodal.json","w") as f:
+    json.dump(history_uni, f, indent=2)
+
+FINAL_PATH = str(SAVE_DIR/"final_model_fused_plus_unimodal.pth")
+torch.save(model.state_dict(), FINAL_PATH)
+print("✅ Saved final model:", FINAL_PATH)
+# ==========================================================
+# 8) Embedders + Missing-modality detection
+# ==========================================================
+@torch.no_grad()
+def embed_fused(fp_img, ir_img):
+    model.eval()
+    logits, z, g, q_fp, q_ir = model.forward_fused(fp_img, ir_img, y=None)
+    return l2n(z, dim=1), g, q_fp, q_ir
+
+@torch.no_grad()
+def embed_fp_only(fp_img):
+    model.eval()
+    logits, z, q_fp = model.forward_fp_only(fp_img, y=None)
+    return l2n(z, dim=1), q_fp
+
+@torch.no_grad()
+def embed_ir_only(ir_img):
+    model.eval()
+    logits, z, q_ir = model.forward_ir_only(ir_img, y=None)
+    return l2n(z, dim=1), q_ir
+# ==========================================================
+# 9) Gallery + RankK + Verification
+# ==========================================================
+def sample_templates(modality, split, lvl, sid, k=5):
+    imgs = list_imgs(OUT_ROOT/modality/split/lvl/sid)
+    if len(imgs)==0: return []
+    return imgs[:min(k, len(imgs))]
+
+@torch.no_grad()
+def build_gallery(method="single", mode="fused", emb_level="clean", templates=5):
+    model.eval()
+    split = "train"
+    gal_names, gal_vecs = [], []
+    rng = random.Random(SEED+123)
+
+    for sid in SUBJECTS:
+        if mode == "fused":
+            fp_imgs = sample_templates("fingerprint", split, emb_level, sid, k=templates)
+            ir_imgs = sample_templates("iris",        split, emb_level, sid, k=templates)
+            if len(fp_imgs)==0 or len(ir_imgs)==0:
+                continue
+            cand = [(fp,ir) for fp in fp_imgs for ir in ir_imgs]
+
+            if method == "single":
+                cand = [(fp_imgs[0], ir_imgs[0])]
+            elif method == "random5":
+                rng.shuffle(cand)
+                cand = cand[:min(templates, len(cand))]
+            elif method == "qf5":
+                scored=[]
+                for fp_p, ir_p in cand:
+                    fp = eval_tf(load_pil(fp_p)).unsqueeze(0).to(DEVICE)
+                    ir = eval_tf(load_pil(ir_p)).unsqueeze(0).to(DEVICE)
+                    z, _, qfp, qir = embed_fused(fp, ir)
+                    score = float((qfp*qir).item())
+                    scored.append((score, z.squeeze(0).cpu()))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                top = scored[:min(templates, len(scored))]
+                z_mean = torch.stack([t[1] for t in top], 0).mean(0)
+                gal_names.append(sid); gal_vecs.append(F.normalize(z_mean, dim=0))
+                continue
+            
+            zs=[]
+            for fp_p, ir_p in cand:
+                fp = eval_tf(load_pil(fp_p)).unsqueeze(0).to(DEVICE)
+                ir = eval_tf(load_pil(ir_p)).unsqueeze(0).to(DEVICE)
+                z, _, _, _ = embed_fused(fp, ir)
+                zs.append(z.squeeze(0).cpu())
+            z_mean = torch.stack(zs, 0).mean(0)
+            gal_names.append(sid); gal_vecs.append(F.normalize(z_mean, dim=0))
+
+        elif mode == "fp":
+            fp_imgs = sample_templates("fingerprint", split, emb_level, sid, k=templates)
+            if len(fp_imgs)==0: continue
+            if method == "single":
+                picks = [fp_imgs[0]]
+            elif method == "random5":
+                picks = fp_imgs[:min(templates, len(fp_imgs))]
+            elif method == "qf5":
+                scored=[]
+                for fp_p in fp_imgs:
+                    fp = eval_tf(load_pil(fp_p)).unsqueeze(0).to(DEVICE)
+                    z, q = embed_fp_only(fp)
+                    scored.append((float(q.item()), z.squeeze(0).cpu()))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                top = scored[:min(templates, len(scored))]
+                z_mean = torch.stack([t[1] for t in top], 0).mean(0)
+                gal_names.append(sid); gal_vecs.append(F.normalize(z_mean, dim=0))
+                continue
+
+            zs=[]
+            for fp_p in picks:
+                fp = eval_tf(load_pil(fp_p)).unsqueeze(0).to(DEVICE)
+                z, q = embed_fp_only(fp)
+                zs.append(z.squeeze(0).cpu())
+            z_mean = torch.stack(zs, 0).mean(0)
+            gal_names.append(sid); gal_vecs.append(F.normalize(z_mean, dim=0))
+
+        elif mode == "ir":
+            ir_imgs = sample_templates("iris", split, emb_level, sid, k=templates)
+            if len(ir_imgs)==0: continue
+            if method == "single":
+                picks = [ir_imgs[0]]
+            elif method == "random5":
+                picks = ir_imgs[:min(templates, len(ir_imgs))]
+            elif method == "qf5":
+                scored=[]
+                for ir_p in ir_imgs:
+                    ir = eval_tf(load_pil(ir_p)).unsqueeze(0).to(DEVICE)
+                    z, q = embed_ir_only(ir)
+                    scored.append((float(q.item()), z.squeeze(0).cpu()))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                top = scored[:min(templates, len(scored))]
+                z_mean = torch.stack([t[1] for t in top], 0).mean(0)
+                gal_names.append(sid); gal_vecs.append(F.normalize(z_mean, dim=0))
+                continue
+
+            zs=[]
+            for ir_p in picks:
+                ir = eval_tf(load_pil(ir_p)).unsqueeze(0).to(DEVICE)
+                z, q = embed_ir_only(ir)
+                zs.append(z.squeeze(0).cpu())
+            z_mean = torch.stack(zs, 0).mean(0)
+            gal_names.append(sid); gal_vecs.append(F.normalize(z_mean, dim=0))
+
+    gal_mat = torch.stack(gal_vecs, 0).to(DEVICE)
+    return gal_names, gal_mat
+
+@torch.no_grad()
+def eval_rankK(level, gal_names, gal_mat, mode="fused", max_fp=6, max_ir=6):
+    model.eval()
+    split="test"
+    correct1=0; correct5=0; total=0
+    name_to_idx = {n:i for i,n in enumerate(gal_names)}
+
+    for sid in SUBJECTS:
+        if sid not in name_to_idx:
+            continue
+        if mode == "fused":
+            fp_imgs = list_imgs(OUT_ROOT/"fingerprint"/split/level/sid)[:max_fp]
+            ir_imgs = list_imgs(OUT_ROOT/"iris"/split/level/sid)[:max_ir]
+            if len(fp_imgs)==0 or len(ir_imgs)==0: continue
+            for fp_p in fp_imgs:
+                for ir_p in ir_imgs:
+                    fp = eval_tf(load_pil(fp_p)).unsqueeze(0).to(DEVICE)
+                    ir = eval_tf(load_pil(ir_p)).unsqueeze(0).to(DEVICE)
+                    z, _, _, _ = embed_fused(fp, ir)
+                    sims = torch.matmul(z, gal_mat.T).squeeze(0)
+                    k = min(5, sims.numel())
+                    topk = torch.topk(sims, k=k).indices.tolist()
+                    pred1 = gal_names[topk[0]]
+                    predk = [gal_names[i] for i in topk]
+                    total += 1
+                    correct1 += int(pred1==sid)
+                    correct5 += int(sid in predk)
+
+        elif mode == "fp":
+            fp_imgs = list_imgs(OUT_ROOT/"fingerprint"/split/level/sid)[:max_fp]
+            if len(fp_imgs)==0: continue
+            for fp_p in fp_imgs:
+                fp = eval_tf(load_pil(fp_p)).unsqueeze(0).to(DEVICE)
+                z, _ = embed_fp_only(fp)
+                sims = torch.matmul(z, gal_mat.T).squeeze(0)
+                k = min(5, sims.numel())
+                topk = torch.topk(sims, k=k).indices.tolist()
+                pred1 = gal_names[topk[0]]
+                predk = [gal_names[i] for i in topk]
+                total += 1
+                correct1 += int(pred1==sid)
+                correct5 += int(sid in predk)
+
+        elif mode == "ir":
+            ir_imgs = list_imgs(OUT_ROOT/"iris"/split/level/sid)[:max_ir]
+            if len(ir_imgs)==0: continue
+            for ir_p in ir_imgs:
+                ir = eval_tf(load_pil(ir_p)).unsqueeze(0).to(DEVICE)
+                z, _ = embed_ir_only(ir)
+                sims = torch.matmul(z, gal_mat.T).squeeze(0)
+                k = min(5, sims.numel())
+                topk = torch.topk(sims, k=k).indices.tolist()
+                pred1 = gal_names[topk[0]]
+                predk = [gal_names[i] for i in topk]
+                total += 1
+                correct1 += int(pred1==sid)
+                correct5 += int(sid in predk)
+
+    return correct1/max(1,total), correct5/max(1,total), total
+
+@torch.no_grad()
+def verification_metrics(level, gal_names, gal_mat, mode="fused", max_fp=6, max_ir=6):
+    model.eval()
+    split="test"
+    name_to_idx = {n:i for i,n in enumerate(gal_names)}
+    genuine=[]; impostor=[]
+
+    for sid in SUBJECTS:
+        if sid not in name_to_idx: continue
+        true_idx = name_to_idx[sid]
+
+        if mode=="fused":
+            fp_imgs = list_imgs(OUT_ROOT/"fingerprint"/split/level/sid)[:max_fp]
+            ir_imgs = list_imgs(OUT_ROOT/"iris"/split/level/sid)[:max_ir]
+            if len(fp_imgs)==0 or len(ir_imgs)==0: continue
+            for fp_p in fp_imgs:
+                for ir_p in ir_imgs:
+                    fp = eval_tf(load_pil(fp_p)).unsqueeze(0).to(DEVICE)
+                    ir = eval_tf(load_pil(ir_p)).unsqueeze(0).to(DEVICE)
+                    z, _, _, _ = embed_fused(fp, ir)
+                    sims = torch.matmul(z, gal_mat.T).squeeze(0).cpu().numpy()
+                    genuine.append(sims[true_idx])
+                    impostor.extend(np.delete(sims, true_idx))
+
+        elif mode=="fp":
+            fp_imgs = list_imgs(OUT_ROOT/"fingerprint"/split/level/sid)[:max_fp]
+            if len(fp_imgs)==0: continue
+            for fp_p in fp_imgs:
+                fp = eval_tf(load_pil(fp_p)).unsqueeze(0).to(DEVICE)
+                z, _ = embed_fp_only(fp)
+                sims = torch.matmul(z, gal_mat.T).squeeze(0).cpu().numpy()
+                genuine.append(sims[true_idx])
+                impostor.extend(np.delete(sims, true_idx))
+
+        elif mode=="ir":
+            ir_imgs = list_imgs(OUT_ROOT/"iris"/split/level/sid)[:max_ir]
+            if len(ir_imgs)==0: continue
+            for ir_p in ir_imgs:
+                ir = eval_tf(load_pil(ir_p)).unsqueeze(0).to(DEVICE)
+                z, _ = embed_ir_only(ir)
+                sims = torch.matmul(z, gal_mat.T).squeeze(0).cpu().numpy()
+                genuine.append(sims[true_idx])
+                impostor.extend(np.delete(sims, true_idx))
+
+    genuine=np.array(genuine, dtype=np.float32)
+    impostor=np.array(impostor, dtype=np.float32)
+    y_true = np.concatenate([np.ones_like(genuine), np.zeros_like(impostor)])
+    y_score= np.concatenate([genuine, impostor])
+
+    auc = roc_auc_score(y_true, y_score)
+    fpr, tpr, thr = roc_curve(y_true, y_score)
+    fnr = 1 - tpr
+    idx = np.argmin(np.abs(fpr - fnr))
+    eer = float((fpr[idx] + fnr[idx]) / 2)
+    eer_thr = float(thr[idx])
+
+    def tar_at_far(target_far):
+        ok = np.where(fpr <= target_far)[0]
+        if len(ok)==0: return float(tpr[0])
+        return float(np.max(tpr[ok]))
+
+    return {
+        "genuine": int(len(genuine)),
+        "impostor": int(len(impostor)),
+        "EER": eer,
+        "EER_thr": eer_thr,
+        "AUC": float(auc),
+        "TAR@1e-3": tar_at_far(1e-3),
+        "TAR@1e-4": tar_at_far(1e-4),
+        "fpr": fpr, "tpr": tpr
+    }
+
+def plot_roc_det(res, title, out_prefix):
+    fpr=res["fpr"]; tpr=res["tpr"]; fnr=1-tpr
+    plt.figure(figsize=(6,6))
+    plt.plot(fpr, tpr)
+    plt.xlabel("FAR"); plt.ylabel("TAR")
+    plt.title(f"ROC - {title} | AUC={res['AUC']:.5f}")
+    plt.grid(True); plt.tight_layout()
+    plt.savefig(FIG_DIR/f"{out_prefix}_roc.png", dpi=200)
+
+    plt.figure(figsize=(6,6))
+    plt.plot(fpr, fnr)
+    plt.xlabel("FAR"); plt.ylabel("FRR")
+    plt.title(f"DET - {title} | EER={res['EER']*100:.3f}%")
+    plt.grid(True); plt.tight_layout()
+    plt.savefig(FIG_DIR/f"{out_prefix}_det.png", dpi=200)
+
+
+# ==========================================================
+# 10) Ablation + Verification + Save
+# ==========================================================
+print("\n✅ Building galleries...")
+gal_m1_names, gal_m1 = build_gallery("single",  "fused", "clean", 5)
+gal_m2_names, gal_m2 = build_gallery("random5", "fused", "clean", 5)
+gal_m3_names, gal_m3 = build_gallery("qf5",     "fused", "clean", 5)
+gal_m4_names, gal_m4 = build_gallery("qf5",     "fp",    "clean", 5)
+gal_m5_names, gal_m5 = build_gallery("qf5",     "ir",    "clean", 5)
+
+methods = [
+    ("M1_Single",    "fused", gal_m1_names, gal_m1),
+    ("M2_Random5",   "fused", gal_m2_names, gal_m2),
+    ("M3_QF5_FINAL", "fused", gal_m3_names, gal_m3),
+    ("M4_FP_only",   "fp",    gal_m4_names, gal_m4),
+    ("M5_IR_only",   "ir",    gal_m5_names, gal_m5),
+]
+
+print("\n✅ Identification (Rank-1/5) ...")
+ab_rows=[]
+for lvl in TEST_LEVELS:
+    for mname, mode, gnames, gmat in methods:
+        r1,r5,n = eval_rankK(lvl, gnames, gmat, mode=mode, max_fp=6, max_ir=6)
+        ab_rows.append([mname, mode, lvl, r1, r5, n])
+        print(f"{mname:<14} | {lvl:<6} | R1={r1*100:6.2f}% | R5={r5*100:6.2f}% | probes={n}")
+
+df_ab = pd.DataFrame(ab_rows, columns=["Method","Mode","Level","Rank1","Rank5","Probes"])
+df_ab.to_csv(SAVE_DIR/"ablation_rank_metrics.csv", index=False)
+print("✅ Saved:", SAVE_DIR/"ablation_rank_metrics.csv")
+
+plt.figure(figsize=(8,5))
+for method_name in df_ab["Method"].unique():
+    sub = df_ab[df_ab["Method"]==method_name].copy()
+    sub["Level"] = pd.Categorical(sub["Level"], categories=TEST_LEVELS, ordered=True)
+    sub = sub.sort_values("Level")
+    plt.plot(sub["Level"], sub["Rank1"]*100, marker="o", label=method_name)
+plt.ylabel("Rank-1 (%)"); plt.xlabel("Difficulty Level"); plt.title("Identification Rank-1 across Levels")
+plt.grid(True); plt.legend(); plt.tight_layout()
+plt.savefig(FIG_DIR/"rank1_ablation.png", dpi=200)
+
+print("\n✅ Verification (fused only) ...")
+ver_rows=[]
+for method_name, mode, gnames, gmat in [
+    ("Single","fused", gal_m1_names, gal_m1),
+    ("Random5","fused", gal_m2_names, gal_m2),
+    ("QF5","fused", gal_m3_names, gal_m3),
+]:
+    for lvl in TEST_LEVELS:
+        res = verification_metrics(lvl, gnames, gmat, mode=mode, max_fp=6, max_ir=6)
+        ver_rows.append([method_name,lvl,res["EER"],res["AUC"],res["TAR@1e-3"],res["TAR@1e-4"],res["EER_thr"]])
+        print(f"\n[{method_name} | {lvl}] Genuine={res['genuine']} | Impostor={res['impostor']}")
+        print(f"  EER = {res['EER']*100:.3f}%  (thr={res['EER_thr']:.4f}) | AUC={res['AUC']:.5f}")
+        print(f"  TAR@FAR=1e-03 = {res['TAR@1e-3']*100:.2f}%")
+        print(f"  TAR@FAR=1e-04 = {res['TAR@1e-4']*100:.2f}%")
+        plot_roc_det(res, title=f"{method_name}-{lvl}", out_prefix=f"{method_name}_{lvl}")
+
+df_ver = pd.DataFrame(ver_rows, columns=["Method","Level","EER","AUC","TAR@1e-3","TAR@1e-4","EER_thr"])
+df_ver.to_csv(SAVE_DIR/"verification_metrics.csv", index=False)
+print("\n✅ Saved:", SAVE_DIR/"verification_metrics.csv")
+
+print("\n✅ DONE.")
+print("✅ Final model:", FINAL_PATH)
+print("✅ Prepared dataset ZIP:", ZIP_PATH)
+print("✅ All publish artifacts:", SAVE_DIR)
+print("✅ Figures:", FIG_DIR)
+import os
+from pathlib import Path
+
+def print_dataset_structure(root_dir, max_depth=5, max_items=3):
+    root_path = Path("/kaggle/input/datasets/khalidjajan/dataset-last3/dataset-last3")
+    if not root_path.exists():
+        print(f"❌ المسار غير موجود: {root_dir}")
+        return
+
+    print(f"📂 {root_path.name}/")
+
+    def walk_dir(current_path, current_depth, prefix):
+        if current_depth > max_depth:
+            return
+
+        try:
+            items = sorted(list(current_path.iterdir()))
+        except PermissionError:
+            return
+
+        # فصل المجلدات عن الملفات لترتيب العرض
+        dirs = [x for x in items if x.is_dir()]
+        files = [x for x in items if x.is_file()]
+        display_items = dirs + files
+        total_items = len(display_items)
+
+        for i, item in enumerate(display_items):
+            if i >= max_items:
+                print(prefix + "└── ... (والمزيد)")
+                break
+
+            is_last = (i == total_items - 1) or (i == max_items - 1)
+            connector = "└── " if is_last else "├── "
+
+            if item.is_dir():
+                print(prefix + connector + "📁 " + item.name)
+                extension = "    " if is_last else "│   "
+                walk_dir(item, current_depth + 1, prefix + extension)
+            else:
+                print(prefix + connector + "📄 " + item.name)
+
+    walk_dir(root_path, 1, "")
+
+# تشغيل الدالة على المجلد الرئيسي للبيانات
+OUT_ROOT = "/kaggle/working/prepared_dataset_ID"
+print("\n🔍 هيكلية قاعدة البيانات (Dataset Tree):\n" + "="*40)
+print_dataset_structure(OUT_ROOT, max_depth=5, max_items=3)
